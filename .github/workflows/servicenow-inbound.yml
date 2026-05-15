@@ -1,0 +1,20 @@
+name: ServiceNow Inbound
+on:
+  repository_dispatch:
+    types: [validation-passed]
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  create-from-dispatch:
+    if: github.event.action == 'validation-passed'
+    uses: ./.github/workflows/servicenow-create-case.yml
+    secrets: inherit
+    with:
+      issue_number: '${{ github.event.client_payload.issue_number }}'
+      catalog_item: ${{ github.event.client_payload.catalog_item || 'General Requests' }}
+      case_type: ${{ github.event.client_payload.case_type || 'Service Request' }}
+      sr_type: ${{ github.event.client_payload.sr_type || '' }}
+      catalog_prefix: ${{ github.event.client_payload.catalog_prefix || '' }}

@@ -1,0 +1,110 @@
+name: ServiceNow Change Request → GitHub
+
+on:
+  repository_dispatch:
+    types: [servicenow-cr-update]
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  cr-update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/github-script@v8
+        env:
+          SERVICENOW_URL: ${{ secrets.SERVICENOW_URL }}
+          SERVICENOW_UI_URL: ${{ secrets.SERVICENOW_UI_URL }}
+          SERVICENOW_USERNAME: ${{ secrets.SERVICENOW_USERNAME }}
+          SERVICENOW_PASSWORD: ${{ secrets.SERVICENOW_PASSWORD }}
+        with:
+          script: |
+            const p = context.payload.client_payload || {};
+            core.info('servicenow-cr-update payload: ' + JSON.stringify(p));
+            const issueNumber = p.github_issue_number;
+            const crNumber    = p.cr_number;
+            const crSysId     = p.cr_sys_id;
+            const STATE_MAP = {
+              '-5': 'New',
+              '-4': 'Assess',
+              '-3': 'Authorize',
+              '-2': 'Scheduled (CAB Approved)',
+              '-1': 'Implement',
+              '0':  'Review',
+              '3':  'Closed',
+            };
+            const SKIP_STATES = new Set(); // no transient states to skip now
+            const rawState = String(p.cr_state || '').trim();
+            const crState  = STATE_MAP[rawState] || rawState;
+            const caseSysId   = p.case_sys_id || '';
+            const action      = p.action;
+            const assignedTo  = (p.assigned_to && p.assigned_to !== 'null') ? p.assigned_to : '';
+            const servicenowUiUrl = process.env.SERVICENOW_UI_URL;
+            const crUrl = crSysId ? `${servicenowUiUrl}/now/nav/ui/classic/params/target/change_request.do?sys_id=${crSysId}` : `#`;
+            const toIST = d => new Date(d.getTime() + 5.5 * 60 * 60 * 1000);
+            const now = new Date();
+            const timestamp = toIST(now).toISOString().replace('T', ' ').slice(0, 19) + ' IST';
+            const formatSNDate = s => {
+              if (!s || s === 'null') return '';
+              const d = new Date(s.replace(' ', 'T') + 'Z');
+              return isNaN(d.getTime()) ? s : toIST(d).toUTCString().replace('GMT', 'IST');
+            };
+            const plannedStart = formatSNDate(p.planned_start);
+            const plannedEnd   = formatSNDate(p.planned_end);
+            const cwBlock = (plannedStart || plannedEnd)
+              ? `\n\n ⏰ **Change Window:** ${plannedStart || '—'} → ${plannedEnd || '—'}`
+              : '';
+            if (!issueNumber || !crNumber || !action) {
+              core.warning('Missing github_issue_number, cr_number, or action — skipping');
+              return;
+            }
+            if (action !== 'created' && action !== 'state_changed' && action !== 'dates_updated') {
+              core.warning('Unknown action: ' + action);
+              return;
+            }
+            if (SKIP_STATES.has(rawState)) {
+              core.info(`Skipping comment for transient state ${rawState} on issue #${issueNumber}`);
+              return;
+            }
+            async function fetchAllCRs(parentSysId) {
+              if (!parentSysId) return [];
+              const snUrl = process.env.SERVICENOW_UI_URL || process.env.SERVICENOW_URL.replace(/\/api\/.*/, '');
+              const auth = Buffer.from(`${process.env.SERVICENOW_USERNAME}:${process.env.SERVICENOW_PASSWORD}`).toString('base64');
+              const queryUrl = `${snUrl}/api/now/table/task?sysparm_query=parent=${parentSysId}^sys_class_name=change_request&sysparm_fields=number,state,sys_id&sysparm_display_value=true&sysparm_limit=50`;
+              const res = await fetch(queryUrl, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
+              if (!res.ok) {
+                core.warning('ServiceNow CR query failed: HTTP ' + res.status);
+                return [];
+              }
+              const data = await res.json();
+              return data.result || [];
+            }
+            const metaLine = (p.is_first_cr !== undefined || p.total_crs !== undefined)
+              ? `\n_CR index: ${p.is_first_cr === undefined ? '—' : p.is_first_cr}, total: ${p.total_crs ?? '—'}_\n`
+              : '';
+            const assignedBlock = assignedTo ? `\n> **Assigned to:** ${assignedTo}` : '';
+            if (action === 'created') {
+              let allCRs = await fetchAllCRs(caseSysId);
+              if (allCRs.length === 0) {
+                allCRs = [{ number: crNumber, sys_id: crSysId, state: crState }];
+              }
+              const crListMarkdown = allCRs.map(cr =>
+                `- [${cr.number}](${servicenowUiUrl}/now/nav/ui/classic/params/target/change_request.do?sys_id=${cr.sys_id}) - ${STATE_MAP[String(cr.state).trim()] || cr.state || 'Unknown'}`
+              ).join('\n');
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: parseInt(issueNumber, 10),
+                body: `💬 **ServiceNow Change Request — Created [#${crNumber}](${crUrl})** [${timestamp}]\n\n> **State:** ${crState}${cwBlock}\n${metaLine}\n**All Change Requests for this Case (${allCRs.length})**\n${crListMarkdown}\n\n---\n*Automatically notified by ServiceNow*`
+              });
+            } else if (action === 'state_changed') {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: parseInt(issueNumber, 10),
+                body: `💬 **ServiceNow Change Request — Updated [#${crNumber}](${crUrl})** [${timestamp}]\n\n> **State:** **${crState}**${assignedBlock}\n${metaLine}\n---\n*Automatically notified by ServiceNow*`
+              });
+            } else if (action === 'dates_updated') {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: parseInt(issueNumber, 10),
+                body: `💬 **ServiceNow Change Request — Schedule Updated [#${crNumber}](${crUrl})** [${timestamp}]\n\n> **State:** **${crState}**${assignedBlock}\n\n⏰ **Change Window:** ${plannedStart || '—'} → ${plannedEnd || '—'}\n${metaLine}\n---\n*Automatically notified by ServiceNow*`
+              });
+            }
